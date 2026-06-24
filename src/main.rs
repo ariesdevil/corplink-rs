@@ -18,8 +18,9 @@ use dns::DNSManager;
 
 use std::env;
 use std::process::exit;
+use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 
 use client::Client;
 use config::{Config, WgConf};
@@ -58,6 +59,18 @@ fn parse_arg() -> String {
 pub const EPERM: i32 = 1;
 pub const ENOENT: i32 = 2;
 pub const ETIMEDOUT: i32 = 110;
+const RECONNECT_DELAY_SECS: u64 = 30;
+const KEEP_ALIVE_INTERVAL_SECS: u64 = 60;
+
+#[derive(Clone, Copy)]
+enum SessionEnd {
+    Shutdown,
+    Reconnect(&'static str),
+}
+
+fn is_retryable_connect_error(msg: &str) -> bool {
+    msg.contains("10220010") || msg.contains("Add VPN information failed")
+}
 
 #[tokio::main]
 async fn main() {
@@ -122,119 +135,154 @@ async fn run() -> Result<()> {
     let with_wg_log = conf.debug_wg.unwrap_or_default();
     let platform = conf.platform.clone();
     let mut c = Client::new(conf).context("failed to initialize client")?;
-    let mut logout_retry = true;
-    let wg_conf: Option<WgConf>;
-
+    let mut reconnect_attempts = 0_u64;
     loop {
-        if c.need_login() {
-            log::info!("not login yet, try to login");
-            c.login().await.context("login failed")?;
-            log::info!("login success");
-        }
-        log::info!("try to connect");
-        match c.connect_vpn().await {
-            Ok(conf) => {
-                wg_conf = Some(conf);
-                break;
+        let mut logout_retry = true;
+        let wg_conf: WgConf = loop {
+            if c.need_login() {
+                log::info!("not login yet, try to login");
+                c.login().await.context("login failed")?;
+                log::info!("login success");
             }
-            Err(e) => {
-                if logout_retry && e.to_string().contains("logout") {
-                    // e contains detail message, so just print it out
-                    log::warn!("{}", e);
-                    logout_retry = false;
-                    continue;
-                } else {
+            log::info!("try to connect");
+            match c.connect_vpn().await {
+                Ok(conf) => break conf,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if logout_retry && msg.contains("logout") {
+                        // e contains detail message, so just print it out
+                        log::warn!("{}", msg);
+                        logout_retry = false;
+                        continue;
+                    }
+                    if is_retryable_connect_error(&msg) {
+                        log::warn!(
+                            "transient vpn connect error: {msg}; retry in {RECONNECT_DELAY_SECS}s"
+                        );
+                        tokio::select! {
+                            _ = wait_for_shutdown_signal() => {
+                                log::info!("shutdown received before reconnect");
+                                return Ok(());
+                            }
+                            _ = tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)) => {}
+                        }
+                        continue;
+                    }
                     return Err(e);
                 }
             }
         };
-    }
-    let wg_conf = wg_conf.ok_or_else(|| anyhow!("wg conf missing after connect loop"))?;
-    let protocol = wg_conf.protocol;
-    let mut uapi = wg::UAPIClient { name: name.clone() };
-    if let Some(listen) = &socks5_listen {
-        log::info!("start wg-corplink (netstack/socks5) on {}", listen);
-        wg::start_wg_go_netstack(&wg_conf, listen, &socks5_username, &socks5_password, with_wg_log)
+
+        let protocol = wg_conf.protocol;
+        let mut uapi = wg::UAPIClient { name: name.clone() };
+        if let Some(listen) = &socks5_listen {
+            log::info!("start wg-corplink (netstack/socks5) on {}", listen);
+            wg::start_wg_go_netstack(
+                &wg_conf,
+                listen,
+                &socks5_username,
+                &socks5_password,
+                with_wg_log,
+            )
             .context("failed to start wg-corplink in netstack mode")?;
-        uapi.config_wg_netstack(&wg_conf)
-            .await
-            .context("failed to config netstack interface with uapi")?;
-        if socks5_username.is_empty() {
-            log::info!("socks5 proxy ready at {} (no auth)", listen);
+            uapi.config_wg_netstack(&wg_conf)
+                .await
+                .context("failed to config netstack interface with uapi")?;
+            if socks5_username.is_empty() {
+                log::info!("socks5 proxy ready at {} (no auth)", listen);
+            } else {
+                log::info!(
+                    "socks5 proxy ready at {} (username/password auth required)",
+                    listen
+                );
+            }
         } else {
-            log::info!(
-                "socks5 proxy ready at {} (username/password auth required)",
-                listen
-            );
+            log::info!("start wg-corplink for {}", &name);
+            wg::start_wg_go(&name, protocol, with_wg_log)
+                .with_context(|| format!("failed to start wg-corplink for {}", name))?;
+            uapi.config_wg(&wg_conf)
+                .await
+                .with_context(|| format!("failed to config interface with uapi for {name}"))?;
         }
-    } else {
-        log::info!("start wg-corplink for {}", &name);
-        wg::start_wg_go(&name, protocol, with_wg_log)
-            .with_context(|| format!("failed to start wg-corplink for {}", name))?;
-        uapi.config_wg(&wg_conf)
-            .await
-            .with_context(|| format!("failed to config interface with uapi for {name}"))?;
-    }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let mut dns_manager = DNSManager::new(dns_backup_filename);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let mut dns_manager = DNSManager::new(dns_backup_filename.clone());
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if use_vpn_dns && !netstack_mode {
-        match dns_manager.set_dns(vec![&wg_conf.dns], vec![]) {
-            Ok(_) => {}
-            Err(err) => {
-                log::warn!("failed to set dns: {}", err);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if use_vpn_dns && !netstack_mode {
+            match dns_manager.set_dns(vec![&wg_conf.dns], vec![]) {
+                Ok(_) => {}
+                Err(err) => {
+                    log::warn!("failed to set dns: {}", err);
+                }
             }
         }
-    }
 
-    let mut exit_code = 0;
-    tokio::select! {
-        _ = wait_for_shutdown_signal() => {},
+        let session_end = tokio::select! {
+            _ = wait_for_shutdown_signal() => SessionEnd::Shutdown,
 
-        // keep alive
-        // _ = c.keep_alive_vpn(&wg_conf, 60) => {
-        //     exit_code = ETIMEDOUT;
-        // },
+            _ = c.keep_alive_vpn(&wg_conf, KEEP_ALIVE_INTERVAL_SECS) => {
+                SessionEnd::Reconnect("vpn keep-alive stopped")
+            },
 
-        // check wg handshake and exit if timeout
-        _ = async {
-            uapi.check_wg_connection().await;
-            log::warn!("last handshake timeout");
-        } => {
-            exit_code = ETIMEDOUT;
-        },
-    }
-
-    // shutdown
-    log::info!("disconnecting vpn...");
-    if let Err(e) = c.disconnect_vpn(&wg_conf).await {
-        log::warn!("failed to disconnect vpn: {}", e)
-    };
-
-    // only logout for feilian_v1
-    if platform.as_deref() == Some(config::PLATFORM_CORPLINK_V1) {
-        log::info!("logging out current terminal...");
-        if let Err(e) = c.logout().await {
-            log::warn!("failed to logout: {}", e)
+            // check wg handshake and reconnect if timeout
+            _ = async {
+                uapi.check_wg_connection().await;
+                log::warn!("last handshake timeout");
+            } => {
+                SessionEnd::Reconnect("last handshake timeout")
+            },
         };
-    }
 
-    wg::stop_wg_go();
+        // shutdown current session before either exiting or reconnecting
+        log::info!("disconnecting vpn...");
+        if let Err(e) = c.disconnect_vpn(&wg_conf).await {
+            log::warn!("failed to disconnect vpn: {}", e)
+        };
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if use_vpn_dns && !netstack_mode {
-        match dns_manager.restore_dns() {
-            Ok(_) => {}
-            Err(err) => {
-                log::warn!("failed to delete dns: {}", err);
+        // only logout for feilian_v1, and only when the user is really exiting.
+        // reconnects should keep the session/cookies so they can be reused.
+        if matches!(session_end, SessionEnd::Shutdown)
+            && platform.as_deref() == Some(config::PLATFORM_CORPLINK_V1)
+        {
+            log::info!("logging out current terminal...");
+            if let Err(e) = c.logout().await {
+                log::warn!("failed to logout: {}", e)
+            };
+        }
+
+        wg::stop_wg_go();
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if use_vpn_dns && !netstack_mode {
+            match dns_manager.restore_dns() {
+                Ok(_) => {}
+                Err(err) => {
+                    log::warn!("failed to delete dns: {}", err);
+                }
+            }
+        }
+
+        match session_end {
+            SessionEnd::Shutdown => break,
+            SessionEnd::Reconnect(reason) => {
+                reconnect_attempts += 1;
+                log::warn!(
+                    "vpn session ended by {reason}; reconnect attempt #{reconnect_attempts} in {RECONNECT_DELAY_SECS}s"
+                );
+                tokio::select! {
+                    _ = wait_for_shutdown_signal() => {
+                        log::info!("shutdown received before reconnect");
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)) => {}
+                }
             }
         }
     }
 
     log::info!("reach exit");
-    exit(exit_code)
+    Ok(())
 }
 
 // Resolve when the process is asked to terminate: ctrl+c (SIGINT) or, on unix,

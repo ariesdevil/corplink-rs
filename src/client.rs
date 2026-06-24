@@ -1,7 +1,7 @@
 use chrono::Utc;
 use std::collections::HashMap;
 use std::fmt;
-use std::path;
+use std::path::{self, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -34,6 +34,7 @@ const USER_AGENT: &str = "CorpLink/201000 (GooglePixel; Android 10; en)";
 #[derive(Clone)]
 pub struct Client {
     conf: Config,
+    cookie_file: PathBuf,
     cookie: Arc<CookieStoreMutex>,
     c: reqwest::Client,
     api_url: ApiUrl,
@@ -144,6 +145,7 @@ impl Client {
         let conf_bak = conf.clone();
         Ok(Client {
             conf,
+            cookie_file,
             cookie: Arc::clone(&cookie_store),
             c,
             api_url: ApiUrl::new(&conf_bak)?,
@@ -158,18 +160,18 @@ impl Client {
     }
 
     fn save_cookie(&self) -> Result<()> {
-        let interface_name = self
-            .conf
-            .interface_name
-            .as_ref()
-            .context("interface name missing in config")?;
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
-            .append(false)
-            .open(format!("{}_{}", interface_name, COOKIE_FILE_SUFFIX))
+            .truncate(true)
+            .open(&self.cookie_file)
             .map(io::BufWriter::new)
-            .with_context(|| "failed to open cookie file for writing")?;
+            .with_context(|| {
+                format!(
+                    "failed to open cookie file {} for writing",
+                    self.cookie_file.display()
+                )
+            })?;
         let c = self
             .cookie
             .lock()
@@ -313,7 +315,9 @@ impl Client {
         log::info!("please scan the QR code or visit the following link to auth corplink:\n{url}");
         match TerminalQrCode::from_bytes(url.as_bytes()) {
             Ok(qr) => qr.print(),
-            Err(e) => {log::warn!("failed to generate qr code: {e}");}
+            Err(e) => {
+                log::warn!("failed to generate qr code: {e}");
+            }
         }
         match method {
             PLATFORM_LARK | PLATFORM_OIDC => {
@@ -683,12 +687,11 @@ impl Client {
         }
     }
 
-    async fn get_first_vpn_by_latency(
+    async fn get_vpn_candidates_by_latency(
         &mut self,
         vpn_info: Vec<RespVpnInfo>,
-    ) -> Option<RespVpnInfo> {
-        let mut fast_vpn = None;
-        let mut min_latency = i64::MAX;
+    ) -> Vec<RespVpnInfo> {
+        let mut candidates = Vec::new();
         for vpn in vpn_info {
             let latency = match self.ping_vpn(vpn.ip.clone(), vpn.api_port).await {
                 Ok(latency) => latency,
@@ -706,15 +709,19 @@ impl Client {
                     _ => format!(", latency {}ms", latency),
                 }
             );
-            if latency != -1 && latency < min_latency {
-                fast_vpn = Some(vpn);
-                min_latency = latency;
+            if latency != -1 {
+                candidates.push((latency, vpn));
             }
         }
-        fast_vpn
+        candidates.sort_by_key(|(latency, _)| *latency);
+        candidates.into_iter().map(|(_, vpn)| vpn).collect()
     }
 
-    async fn get_first_available_vpn(&mut self, vpn_info: Vec<RespVpnInfo>) -> Option<RespVpnInfo> {
+    async fn get_available_vpn_candidates(
+        &mut self,
+        vpn_info: Vec<RespVpnInfo>,
+    ) -> Vec<RespVpnInfo> {
+        let mut candidates = Vec::new();
         for vpn in vpn_info {
             let latency = match self.ping_vpn(vpn.ip.clone(), vpn.api_port).await {
                 Ok(latency) => latency,
@@ -724,14 +731,13 @@ impl Client {
                 }
             };
             if latency != -1 {
-                return Some(vpn);
+                candidates.push(vpn);
             }
         }
-        None
+        candidates
     }
 
-    // ping vpn and return latency in ms. Will return Err on error
-    async fn ping_vpn(&mut self, ip: String, api_port: u16) -> Result<i64> {
+    fn set_vpn_api_url(&mut self, ip: &str, api_port: u16) -> Result<()> {
         {
             // config cookie
             let mut cookie = self
@@ -752,13 +758,12 @@ impl Client {
                     cookies.push(c.clone());
                 }
             }
-            url.set_host(Some(ip.as_str()))
-                .context("failed to set ping host")?;
+            url.set_host(Some(ip)).context("failed to set ping host")?;
             url.set_port(Some(api_port))
                 .or_else(|_| bail!("failed to set ping port"))?;
             for c in cookies {
                 let mut c = cookie::Cookie::new(c.name().to_string(), c.value().to_string());
-                c.set_domain(ip.clone());
+                c.set_domain(ip.to_string());
                 let c = Cookie::try_from_raw_cookie(&c, &url.clone())
                     .context("failed to convert raw cookie")?;
                 cookie
@@ -768,6 +773,12 @@ impl Client {
             self.api_url.vpn_param.url = url.to_string().trim_end_matches('/').to_string();
         }
         self.save_cookie()?;
+        Ok(())
+    }
+
+    // ping vpn and return latency in ms. Will return Err on error
+    async fn ping_vpn(&mut self, ip: String, api_port: u16) -> Result<i64> {
+        self.set_vpn_api_url(&ip, api_port)?;
         let req_start = Utc::now().timestamp_millis();
         let resp = self.request::<String>(ApiName::PingVPN, None).await?;
         let req_end = Utc::now().timestamp_millis();
@@ -832,6 +843,11 @@ impl Client {
         }
     }
 
+    fn is_retryable_fetch_peer_error(err: &anyhow::Error) -> bool {
+        let msg = err.to_string();
+        msg.contains("10220010") || msg.contains("Add VPN information failed")
+    }
+
     pub async fn connect_vpn(&mut self) -> Result<WgConf> {
         let vpn_info = self.list_vpn().await?;
 
@@ -875,21 +891,26 @@ impl Client {
             })
             .collect();
 
-        let vpn = match self.conf.vpn_select_strategy.clone() {
+        let vpn_candidates = match self.conf.vpn_select_strategy.clone() {
             Some(strategy) => match strategy.as_str() {
-                STRATEGY_LATENCY => self.get_first_vpn_by_latency(filtered_vpn).await,
-                STRATEGY_DEFAULT => self.get_first_available_vpn(filtered_vpn).await,
+                STRATEGY_LATENCY => self.get_vpn_candidates_by_latency(filtered_vpn).await,
+                STRATEGY_DEFAULT => self.get_available_vpn_candidates(filtered_vpn).await,
                 _ => bail!("unsupported strategy"),
             },
-            None => self.get_first_available_vpn(filtered_vpn).await,
+            None => self.get_available_vpn_candidates(filtered_vpn).await,
         };
 
-        let vpn = match vpn {
-            Some(ref vpn) => vpn,
-            None => bail!("no vpn available"),
-        };
-        let vpn_addr = format!("{}:{}", vpn.ip, vpn.vpn_port);
-        log::info!("try connect to {}, address {}", vpn.en_name, vpn_addr);
+        if vpn_candidates.is_empty() {
+            bail!("no vpn available");
+        }
+
+        log::info!(
+            "vpn candidate order: {:?}",
+            vpn_candidates
+                .iter()
+                .map(|i| i.en_name.clone())
+                .collect::<Vec<String>>()
+        );
 
         let key = self
             .conf
@@ -897,8 +918,39 @@ impl Client {
             .as_ref()
             .context("public key missing in config")?
             .clone();
-        log::info!("try to get wg conf from remote");
-        let wg_info = self.fetch_peer_info(&key).await?;
+
+        let mut last_err = None;
+        for (index, vpn) in vpn_candidates.iter().enumerate() {
+            self.set_vpn_api_url(&vpn.ip, vpn.api_port)
+                .with_context(|| format!("failed to select vpn api endpoint {}", vpn.en_name))?;
+            log::info!("try to get wg conf from remote");
+            match self.fetch_peer_info(&key).await {
+                Ok(wg_info) => return self.build_wg_conf(vpn, wg_info),
+                Err(err)
+                    if Self::is_retryable_fetch_peer_error(&err)
+                        && index + 1 < vpn_candidates.len() =>
+                {
+                    log::warn!(
+                        "failed to add vpn information on {}, trying next node: {}",
+                        vpn.en_name,
+                        err
+                    );
+                    last_err = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        match last_err {
+            Some(err) => Err(err),
+            None => bail!("no vpn available"),
+        }
+    }
+
+    fn build_wg_conf(&self, vpn: &RespVpnInfo, wg_info: RespWgInfo) -> Result<WgConf> {
+        let vpn_addr = format!("{}:{}", vpn.ip, vpn.vpn_port);
+        log::info!("try connect to {}, address {}", vpn.en_name, vpn_addr);
+
         let mtu = wg_info.setting.vpn_mtu;
         let dns = wg_info.setting.vpn_dns;
         let peer_key = wg_info.public_key;
@@ -1061,8 +1113,11 @@ impl Client {
             match self.report_vpn_status(conf).await {
                 Ok(_) => (),
                 Err(err) => {
-                    log::warn!("keep alive error: {}", err);
-                    return;
+                    if err.to_string().contains("logout") {
+                        log::warn!("keep alive stopped because login session expired: {}", err);
+                        return;
+                    }
+                    log::warn!("keep alive error, will retry: {}", err);
                 }
             }
             tokio::time::sleep(Duration::from_secs(interval)).await;
@@ -1087,6 +1142,12 @@ impl Client {
             .await?;
         match resp.code {
             0 => Ok(()),
+            101 => {
+                let msg = resp
+                    .message
+                    .unwrap_or_else(|| "logout required".to_string());
+                self.handle_logout_err(msg).await
+            }
             _ => bail!(format!(
                 "failed to report connection with error {}: {}",
                 resp.code,
